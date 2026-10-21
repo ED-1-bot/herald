@@ -67,6 +67,8 @@ the app talks to your gateway directly.
 
 **Stay connected**
 - Notifications when a turn finishes or needs you, with inline approve, answer and reply
+- A voice chat carries on like a call: its own notification with the call's clock, Mute, what the turn has spent,
+  and a tap that brings the call back to the screen
 - Optional end-to-end encrypted push from outside your network, without Google services
 - Several saved gateways, each kept signed in
 - An encrypted offline copy of recent chats, readable while the gateway can't be reached

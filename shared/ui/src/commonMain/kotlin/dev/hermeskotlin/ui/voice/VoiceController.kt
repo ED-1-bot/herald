@@ -6,6 +6,7 @@ import dev.hermeskotlin.core.chat.ChatState
 import dev.hermeskotlin.core.chat.InputAnswers
 import dev.hermeskotlin.core.chat.InputRequest
 import dev.hermeskotlin.core.chat.SendOutcome
+import dev.hermeskotlin.core.chat.SessionUsage
 import dev.hermeskotlin.core.gateway.GatewayUrl
 import dev.hermeskotlin.core.network.ApiResult
 import dev.hermeskotlin.core.network.errorMessage
@@ -30,6 +31,7 @@ import dev.hermeskotlin.core.voice.SpeechStreams
 import dev.hermeskotlin.core.voice.SpokenAudio
 import dev.hermeskotlin.core.voice.VoiceActivity
 import dev.hermeskotlin.core.voice.VoiceAnswers
+import dev.hermeskotlin.core.voice.VoiceCallNotice
 import dev.hermeskotlin.core.voice.DeviceLock
 import dev.hermeskotlin.core.voice.VoiceRecorder
 import dev.hermeskotlin.core.voice.isTtsEcho
@@ -38,6 +40,9 @@ import dev.hermeskotlin.core.voice.readAloudText
 import dev.hermeskotlin.core.voice.speakableText
 import dev.hermeskotlin.core.voice.speechChunks
 import dev.hermeskotlin.core.voice.speakableSoFar
+import dev.hermeskotlin.core.voice.tokensPerSecond
+import dev.hermeskotlin.core.voice.voiceCallContext
+import dev.hermeskotlin.core.voice.voiceCallDetail
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -56,6 +61,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
@@ -69,6 +75,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.time.Clock
 
 enum class VoicePhase { Off, Connecting, Listening, Transcribing, Thinking, Speaking }
 
@@ -166,6 +173,17 @@ class VoiceController(
     private var dictationFinished = false
     private var live: LiveConversation? = null
     private var held = false
+    /** When the chat began, for the call notification's clock. */
+    private var callStartedAt = 0L
+    /** The microphone the chained chat is listening with, so the call's Mute can take it away mid-sentence. */
+    private var listening: Job? = null
+    /** When the running turn's prompt went out, and the totals it started from: the two make a pace. */
+    private var turnAt = 0L
+    private var turnFrom: SessionUsage? = null
+    private var noticeJob: Job? = null
+    /** When the call's notification was last tapped: the chat comes back to the screen, unfolded. */
+    private val _unfold = MutableStateFlow(0L)
+    val unfold: StateFlow<Long> = _unfold.asStateFlow()
     /** The room's quiet floor as the chat's last listen over the voice left it, for the next one. */
     private var roomFloor = 0f
     /** Herald went out of sight since the chat started. */
@@ -200,6 +218,9 @@ class VoiceController(
         noSpeechStream = null
         // Held now, on the tap: Android only lets the microphone go to the background from the foreground.
         away = false
+        callStartedAt = Clock.System.now().toEpochMilliseconds()
+        turnAt = 0L
+        turnFrom = null
         held = keepAlive?.hold(
             onEnd = ::stopChat,
             onLost = {
@@ -207,7 +228,12 @@ class VoiceController(
                 // Refused after the app already went away: it can't listen from there.
                 if (away) stopChat()
             },
+            // The call's own buttons, which the screen isn't there to take: the microphone, and the chat back.
+            onMute = ::setMuted,
+            onOpen = { _unfold.value = Clock.System.now().toEpochMilliseconds() },
         ) == true
+        // Held like a call, the notification says what the chat is doing, and what it costs.
+        if (held) follow(session)
         val job = scope.launch {
             try {
                 if (startLive(session, gateway, profile, opener)) return@launch
@@ -225,6 +251,10 @@ class VoiceController(
             // A newer chat may already hold it again.
             if (chatJob === job || chatJob == null) {
                 held = false
+                noticeJob?.cancel()
+                noticeJob = null
+                turnAt = 0L
+                turnFrom = null
                 keepAlive?.release()
             }
         }
@@ -246,6 +276,8 @@ class VoiceController(
                 speak(said, gateway, profile)
             }
             while (currentCoroutineContext().isActive) {
+                // Muted from the call: the microphone is off, and the chat waits for it to be put back on.
+                if (_chat.value.muted) _chat.first { !it.muted }
                 val turn = converseOnce(session, gateway, profile, VoiceActivity(silenceMs = pauseMs), cutIn)
                 cutIn = null
                 when (turn) {
@@ -311,18 +343,66 @@ class VoiceController(
         return true
     }
 
-    /** Turns the microphone off or on in a live call. */
-    fun toggleMute() {
-        val conversation = live ?: return
-        val muted = !_chat.value.muted
-        conversation.setMuted(muted)
+    /**
+     * Turns the microphone off or on: in a live call, and in the chained chat, which stops listening for it.
+     */
+    fun toggleMute() = setMuted(!_chat.value.muted)
+
+    /**
+     * Puts the microphone off or on, from the screen or from the call's notification. A live call tells the vendor; the
+     * chained chat stops listening instead, and drops what it was hearing, so a word said after Mute is never sent.
+     */
+    fun setMuted(muted: Boolean) {
+        if (muted == _chat.value.muted) return
+        live?.setMuted(muted)
+        // Said before the microphone is taken away, so a chat that has just finished a turn waits instead of listening.
         _chat.update { it.copy(muted = muted) }
+        if (muted) listening?.cancel(Muted())
     }
 
     fun stopChat() {
         stoppedByUser = true
         chatJob?.cancel()
         chatJob = null
+    }
+
+    /**
+     * Keeps the call's notification saying what the chat is doing, while it's held. Only the chat holding it is
+     * followed: an older one finishing later mustn't overwrite the call that's on.
+     */
+    private fun follow(session: ChatSession) {
+        noticeJob?.cancel()
+        noticeJob = scope.launch {
+            var shown: VoiceCallNotice? = null
+            var shownAt = 0L
+            combine(_chat, session.state) { chat, chatState -> noticeOf(chat, chatState) }
+                .distinctUntilChanged()
+                .collect { notice ->
+                    // The tokens move with every few words, and a shade entry that rewrites itself that fast is noise:
+                    // the line and the microphone go out at once, the numbers wait their turn.
+                    val now = Clock.System.now().toEpochMilliseconds()
+                    val previous = shown
+                    val urgent = previous == null || notice.line != previous.line || notice.muted != previous.muted
+                    if (!urgent && now - shownAt < NOTICE_EVERY_MS) return@collect
+                    shown = notice
+                    shownAt = now
+                    keepAlive?.show(notice)
+                }
+        }
+    }
+
+    /** What the call's notification says now: how the chat is going, and what this turn has spent. */
+    private fun noticeOf(chat: VoiceChatState, state: ChatState): VoiceCallNotice {
+        val turn = turnFrom?.let { start -> state.usage?.minus(start) }
+        val seconds = if (turnAt == 0L) 0.0 else (Clock.System.now().toEpochMilliseconds() - turnAt) / 1_000.0
+        return VoiceCallNotice(
+            line = label(chat).ifBlank { "Voice chat" },
+            // A live call's tokens are the vendor's to count, and it doesn't report them as they're spent.
+            detail = if (chat.live) null else voiceCallDetail(turn, tokensPerSecond(turn?.output ?: 0, seconds)),
+            context = voiceCallContext(state.usage),
+            muted = chat.muted,
+            startedAt = callStartedAt,
+        )
     }
 
     /** Cuts the reply being read aloud and listens again. */
@@ -368,6 +448,9 @@ class VoiceController(
         }
 
         _chat.update { it.copy(phase = VoicePhase.Thinking, caption = transcript.trim(), captionIsVoice = false) }
+        // The turn's clock starts with its prompt, so the call can show what it spends a second.
+        turnAt = Clock.System.now().toEpochMilliseconds()
+        turnFrom = session.state.value.usage
         val sentAt = session.state.value.messages.size
         voicedSoFar = ""
         voicedUntilAsked = false
@@ -632,11 +715,10 @@ class VoiceController(
     private suspend fun hear(gateway: GatewayUrl, profile: String?, activity: VoiceActivity): Heard {
         _chat.update { it.copy(phase = VoicePhase.Listening, level = 0f, hearing = false) }
         val recording = try {
-            recorder.record(
-                activity,
-                onLevel = { level -> _chat.update { it.copy(level = level) } },
-                onSpeech = { _chat.update { it.copy(hearing = true) } },
-            )
+            listen(activity)
+        } catch (e: Muted) {
+            // Taken away by the call's Mute: nothing was heard and nothing failed, and the chat waits for it to go on.
+            return Heard.Silence
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -656,6 +738,33 @@ class VoiceController(
         _chat.update { it.copy(error = null) }
         return if (transcript.isBlank()) Heard.Silence else Heard.Words(transcript)
     }
+
+    /**
+     * Records one listen, as a job of its own so the call's Mute has something to take away mid-sentence: what was
+     * being said then is dropped rather than sent.
+     */
+    private suspend fun listen(activity: VoiceActivity): Recording {
+        // Muted between one turn and the next: there's nothing to listen with, and nothing lost by not trying.
+        if (_chat.value.muted) throw Muted()
+        // A child of the chat's own job, so ending the chat takes the microphone with it, and one of its own so the
+        // call's Mute can take this listen alone.
+        val job = CoroutineScope(currentCoroutineContext()).async {
+            recorder.record(
+                activity,
+                onLevel = { level -> _chat.update { it.copy(level = level) } },
+                onSpeech = { _chat.update { it.copy(hearing = true) } },
+            )
+        }
+        listening = job
+        try {
+            return job.await()
+        } finally {
+            if (listening === job) listening = null
+        }
+    }
+
+    /** The microphone taken away by the call's Mute, rather than by the chat ending. */
+    private class Muted : CancellationException("Muted from the call")
 
     /** The question or approval Hermes waits on in [chat] that can be answered aloud. */
     private fun askable(chat: ChatState): InputRequest? = chat.inputRequests.firstOrNull {
@@ -1072,6 +1181,8 @@ class VoiceController(
         const val DICTATION_SILENCE_MS = 3_000L
         const val DICTATION_IDLE_MS = 15_000L
         const val DICTATION_MAX_MS = 120_000L
+        /** How often the call's notification takes a new set of numbers: faster than this is a shade that flickers. */
+        const val NOTICE_EVERY_MS = 2_000L
     }
 }
 

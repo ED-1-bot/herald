@@ -23,6 +23,7 @@ import dev.hermeskotlin.android.HeraldActivity
 import dev.hermeskotlin.android.R
 import dev.hermeskotlin.core.chat.ApprovalChoice
 import dev.hermeskotlin.core.chat.InputRequest
+import dev.hermeskotlin.core.voice.VoiceCallNotice
 import dev.hermeskotlin.core.connection.ConnectionState
 import dev.hermeskotlin.core.phone.AgentCall
 import dev.hermeskotlin.core.phone.CallOpeners
@@ -188,15 +189,28 @@ class ChatNotifications(
             .build()
     }
 
-    /** The ongoing notification of a voice chat kept up like a call ([VoiceCallService]): back to it, or [end] it. */
-    fun voiceCall(end: PendingIntent): Notification = base(CHANNEL_VOICE)
-        .setContentTitle("Voice chat")
-        .setContentText("Talking with Hermes")
+    /**
+     * The ongoing notification of a voice chat kept up like a call ([VoiceCallService]): how the chat is going, what it
+     * has spent, and a timer counting from when it began, with [mute] and [end] beside it. Tapping it brings the call
+     * back to the screen. It has a channel and an id of its own, so nothing else stacks onto it.
+     */
+    fun voiceCall(notice: VoiceCallNotice, mute: PendingIntent, end: PendingIntent): Notification = base(CHANNEL_VOICE)
+        .setContentTitle(notice.line)
+        .setContentText(notice.detail ?: "Talking with Hermes")
+        .setSubText(notice.context)
+        .setContentIntent(openCall())
         .setCategory(NotificationCompat.CATEGORY_CALL)
         .setOngoing(true)
+        // Tapping a call's notification opens the call; it doesn't answer and it doesn't dismiss the call.
         .setAutoCancel(false)
         .setSilent(true)
+        .setOnlyAlertOnce(true)
+        // The system draws the call's clock itself, from when the chat began: it ticks with no re-post.
+        .setShowWhen(true)
+        .setUsesChronometer(true)
+        .setWhen(notice.startedAt)
         .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+        .addAction(0, if (notice.muted) "Unmute" else "Mute", mute)
         .addAction(0, "End", end)
         .build()
 
@@ -738,6 +752,17 @@ class ChatNotifications(
         return PendingIntent.getActivity(context, requestCode, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
     }
 
+    /**
+     * The call's notification tapped: Herald comes back, and the chat it reopens puts the call back on screen. The
+     * activity asks the keeper for that, since only the voice chat knows where it was folded to.
+     */
+    private fun openCall(): PendingIntent {
+        val intent = appIntent()
+            .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            .putExtra(EXTRA_OPEN_CALL, true)
+        return PendingIntent.getActivity(context, 11, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+    }
+
     private fun action(name: String, key: String, mutable: Boolean = false, extras: Intent.() -> Unit = {}): PendingIntent {
         val intent = Intent(context, NotificationActionReceiver::class.java).setAction(name).apply(extras)
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or if (mutable) PendingIntent.FLAG_MUTABLE else PendingIntent.FLAG_IMMUTABLE
@@ -766,6 +791,9 @@ class ChatNotifications(
 
         /** On the launch intent of a room's notification: the hosted room's id (its name in [EXTRA_OPEN_TITLE]). */
         const val EXTRA_OPEN_ROOM = "open_room"
+
+        /** On the launch intent of a voice chat's call notification: the call is still running, so show it again. */
+        const val EXTRA_OPEN_CALL = "open_call"
 
         /** On the launch intent of a notification about a chat: that chat's stored session id, and its title. */
         const val EXTRA_OPEN_SESSION = "open_session_id"

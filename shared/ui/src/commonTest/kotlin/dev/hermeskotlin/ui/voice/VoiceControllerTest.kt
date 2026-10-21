@@ -16,6 +16,8 @@ import dev.hermeskotlin.core.voice.Recording
 import dev.hermeskotlin.core.voice.SpeechPlayer
 import dev.hermeskotlin.core.voice.SpokenAudio
 import dev.hermeskotlin.core.voice.VoiceActivity
+import dev.hermeskotlin.core.voice.VoiceCallNotice
+import dev.hermeskotlin.core.voice.VoiceKeepAlive
 import dev.hermeskotlin.core.voice.VoiceRecorder
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.respond
@@ -29,7 +31,9 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
@@ -582,5 +586,101 @@ class VoiceControllerTest {
         player.started.receive()
         voice.onBackground()
         assertNull(voice.reading.value.key)
+    }
+
+    /**
+     * Hears you, then never hears the pause: only the call's Mute, or the chat ending, takes the microphone away.
+     * Each listen it starts says so on [started], so a test can tell waiting from listening.
+     */
+    private class HangingRecorder : VoiceRecorder {
+        var listens = 0
+        val started = Channel<Unit>(Channel.UNLIMITED)
+        override suspend fun record(activity: VoiceActivity, onLevel: (Float) -> Unit, onSpeech: () -> Unit): Recording {
+            listens++
+            started.trySend(Unit)
+            onLevel(0.5f)
+            awaitCancellation()
+        }
+
+        override fun finish() = Unit
+    }
+
+    /** The call kept up while a voice chat runs, as the notification's buttons reach it. */
+    private class CallKeeper : VoiceKeepAlive {
+        var onEnd: (() -> Unit)? = null
+        var onMute: ((Boolean) -> Unit)? = null
+        var onOpen: (() -> Unit)? = null
+        /** What the notification was told, each time it was posted. Background work writes it: it's a flow. */
+        val notices = MutableStateFlow(emptyList<VoiceCallNotice>())
+
+        override fun hold(onEnd: () -> Unit, onLost: () -> Unit, onMute: (Boolean) -> Unit, onOpen: () -> Unit): Boolean {
+            this.onEnd = onEnd
+            this.onMute = onMute
+            this.onOpen = onOpen
+            return true
+        }
+
+        override fun release() = Unit
+
+        override fun show(notice: VoiceCallNotice) {
+            notices.update { it + notice }
+        }
+
+        override fun open() {
+            onOpen?.invoke()
+        }
+    }
+
+    @Test
+    fun theCallsMuteTakesTheMicrophoneAwayUntilItsPutBackOn() = runTest {
+        val requests = Requests()
+        val recorder = HangingRecorder()
+        val keeper = CallKeeper()
+        val session = offlineSession()
+        val voice = VoiceController(
+            audio("unused", requests), recorder, FakePlayer(), backgroundScope, backgroundScope, keepAlive = keeper,
+        )
+
+        voice.startChat(session, gateway, null)
+        recorder.started.receive()
+        assertEquals(1, recorder.listens)
+
+        keeper.onMute!!(true)
+        voice.chat.first { it.muted }
+        // Muted, the listen it was in the middle of is gone, and no new one takes its place.
+        assertNull(recorder.started.tryReceive().getOrNull())
+        assertEquals(1, recorder.listens)
+        // What was being said went with the microphone: nothing transcribed, nothing sent.
+        assertTrue(requests.none { it.url.encodedPath == "/api/audio/transcribe" })
+        assertTrue(session.state.value.messages.isEmpty())
+
+        // Put back on, the chat listens again.
+        keeper.onMute!!(false)
+        recorder.started.receive()
+        assertEquals(2, recorder.listens)
+        voice.stopChat()
+    }
+
+    @Test
+    fun theCallsNotificationFollowsTheChatAndReopensIt() = runTest {
+        val keeper = CallKeeper()
+        val recorder = HangingRecorder()
+        val voice = VoiceController(
+            audio("unused", Requests()), recorder, FakePlayer(), backgroundScope, backgroundScope, keepAlive = keeper,
+        )
+
+        voice.startChat(offlineSession(), gateway, null)
+        val listening = keeper.notices.first { it.isNotEmpty() }.last()
+        assertEquals("Listening…", listening.line)
+        assertTrue(listening.startedAt > 0)
+
+        keeper.onMute!!(true)
+        val muted = keeper.notices.first { it.lastOrNull()?.muted == true }.last()
+        assertEquals("Muted", muted.line)
+
+        // The call's own tap: the chat comes back to the screen, unfolded.
+        keeper.open()
+        assertTrue(voice.unfold.value > 0)
+        voice.stopChat()
     }
 }

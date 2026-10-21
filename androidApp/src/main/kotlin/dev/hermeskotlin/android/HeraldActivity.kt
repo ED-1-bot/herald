@@ -25,6 +25,7 @@ import androidx.core.content.pm.ShortcutManagerCompat
 import dev.hermeskotlin.android.notify.BotNotifier
 import dev.hermeskotlin.android.notify.BotShortcuts
 import dev.hermeskotlin.android.notify.ChatNotifications
+import dev.hermeskotlin.android.notify.VoiceCallKeeper
 import dev.hermeskotlin.android.phone.PhoneConfirmations
 import dev.hermeskotlin.ui.settings.AppIconRestart
 import dev.hermeskotlin.ui.settings.PhoneQuestion
@@ -72,6 +73,7 @@ class HeraldActivity : FragmentActivity() {
     private val appScope: CoroutineScope by inject()
     private val bots: BotNotifier by inject()
     private val notifications: ChatNotifications by inject()
+    private val voiceCalls: VoiceCallKeeper by inject()
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
     private val app get() = application as HermesApplication
@@ -140,6 +142,11 @@ class HeraldActivity : FragmentActivity() {
         intent.getStringExtra(ChatNotifications.EXTRA_ANSWERED_CALL)?.let {
             notifications.answered(it)
             intent.removeExtra(ChatNotifications.EXTRA_ANSWERED_CALL)
+        }
+        // The voice chat's call notification: the call is still running, so the chat puts it back on screen.
+        if (intent.getBooleanExtra(ChatNotifications.EXTRA_OPEN_CALL, false)) {
+            voiceCalls.open()
+            intent.removeExtra(ChatNotifications.EXTRA_OPEN_CALL)
         }
         if (appLock.locked.value) {
             app.heldIntent = intent

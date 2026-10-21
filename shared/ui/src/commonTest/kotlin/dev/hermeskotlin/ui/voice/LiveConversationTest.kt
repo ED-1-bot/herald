@@ -20,6 +20,7 @@ import dev.hermeskotlin.core.voice.SpeechPlayer
 import dev.hermeskotlin.core.voice.SpokenAudio
 import dev.hermeskotlin.core.voice.VoiceActivity
 import dev.hermeskotlin.core.voice.VoiceKeepAlive
+import dev.hermeskotlin.core.voice.VoiceCallNotice
 import dev.hermeskotlin.core.voice.VoiceRecorder
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.respond
@@ -800,11 +801,25 @@ class LiveConversationTest {
         var holding = false
         var onEnd: (() -> Unit)? = null
         var onLost: (() -> Unit)? = null
-        override fun hold(onEnd: () -> Unit, onLost: () -> Unit): Boolean {
+        var onMute: ((Boolean) -> Unit)? = null
+        var onOpen: (() -> Unit)? = null
+        /** What the call's notification was last told, so a test can read it back. */
+        var notices = mutableListOf<VoiceCallNotice>()
+        override fun hold(onEnd: () -> Unit, onLost: () -> Unit, onMute: (Boolean) -> Unit, onOpen: () -> Unit): Boolean {
             holding = grants
             this.onEnd = onEnd
             this.onLost = onLost
+            this.onMute = onMute
+            this.onOpen = onOpen
             return grants
+        }
+
+        override fun show(notice: VoiceCallNotice) {
+            notices += notice
+        }
+
+        override fun open() {
+            onOpen?.invoke()
         }
 
         override fun release() {

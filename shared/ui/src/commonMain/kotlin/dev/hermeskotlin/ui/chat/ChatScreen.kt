@@ -441,6 +441,7 @@ fun ChatScreen(
         attachmentError = attachmentError,
         comments = viewModel.comments.collectAsStateWithLifecycle().value,
         voiceChat = viewModel.voice.chat.collectAsStateWithLifecycle().value,
+        unfold = viewModel.voice.unfold.collectAsStateWithLifecycle().value,
         dictation = viewModel.voice.dictation.collectAsStateWithLifecycle().value,
         readAloud = viewModel.voice.reading.collectAsStateWithLifecycle().value,
         suggestions = viewModel.suggestions.collectAsStateWithLifecycle().value,
@@ -581,6 +582,8 @@ internal fun ChatView(
     /** Comments on parts of the chat, waiting for the next send. */
     comments: List<PendingComment> = emptyList(),
     voiceChat: VoiceChatState,
+    /** Counts the taps on the call's notification: a new count unfolds the voice screen again. */
+    unfold: Long = 0L,
     dictation: DictationState,
     /** The reply being read aloud, and why the last one couldn't be. */
     readAloud: ReadAloudState = ReadAloudState(),
@@ -639,6 +642,8 @@ internal fun ChatView(
         val voiceOn = voiceChat.phase != VoicePhase.Off
         val voiceFull = voiceOn && !voiceFolded
         LaunchedEffect(voiceOn) { if (!voiceOn) voiceFolded = false }
+        // The call's notification tapped: the call comes back to the whole screen, if it's still on.
+        LaunchedEffect(unfold) { if (unfold > 0 && voiceOn) voiceFolded = false }
         // A reply read aloud plays to its end with the phone put down, and stops if it leaves the chat
         // (regenerated, or a reload that keys it anew), so its Stop is never gone while it plays.
         KeepScreenOn(readAloud.key != null)
