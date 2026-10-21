@@ -8,7 +8,6 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
-import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import dev.hermeskotlin.core.voice.VoiceCallNotice
@@ -58,9 +57,9 @@ class VoiceCallService : Service() {
         false
     }
 
-    /** The chat changed: the same call notification, rebuilt. Its id is the call's, so it replaces the old one. */
+    /** The chat changed: the same call notification, rebuilt in place. */
     private fun show(notice: VoiceCallNotice) {
-        NotificationManagerCompat.from(this).notify(ChatNotifications.VOICE_ID, notification(notice))
+        notifications.updateVoiceCall(notice, mute(), end())
     }
 
     private fun notification(notice: VoiceCallNotice) = notifications.voiceCall(notice, mute(), end())

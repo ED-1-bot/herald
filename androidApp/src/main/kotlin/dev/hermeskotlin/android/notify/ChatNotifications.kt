@@ -214,6 +214,13 @@ class ChatNotifications(
         .addAction(0, "End", end)
         .build()
 
+    /**
+     * The call's notification again, in place of the one showing, as the chat moves on. Never a new entry: the same
+     * id, so the clock and the buttons stay where the user last saw them.
+     */
+    fun updateVoiceCall(notice: VoiceCallNotice, mute: PendingIntent, end: PendingIntent) =
+        post(null, VOICE_ID, voiceCall(notice, mute, end))
+
     fun postOngoing(connection: ConnectionState, pushAnywhere: Boolean = false) =
         post(null, WORKING_ID, ongoing(connection, pushAnywhere))
 
