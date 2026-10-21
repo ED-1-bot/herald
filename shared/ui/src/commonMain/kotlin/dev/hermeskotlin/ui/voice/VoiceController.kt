@@ -75,6 +75,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import dev.hermeskotlin.ui.chat.runningTool
+import dev.hermeskotlin.ui.chat.toolVerb
 import kotlin.time.Clock
 
 enum class VoicePhase { Off, Connecting, Listening, Transcribing, Thinking, Speaking }
@@ -395,8 +397,10 @@ class VoiceController(
     private fun noticeOf(chat: VoiceChatState, state: ChatState): VoiceCallNotice {
         val turn = turnFrom?.let { start -> state.usage?.minus(start) }
         val seconds = if (turnAt == 0L) 0.0 else (Clock.System.now().toEpochMilliseconds() - turnAt) / 1_000.0
+        // The tool at work says more than "Thinking…" does, and a shade entry has room for one line.
+        val tool = state.runningTool()?.name?.takeIf { chat.phase == VoicePhase.Thinking }
         return VoiceCallNotice(
-            line = label(chat).ifBlank { "Voice chat" },
+            line = tool?.toolVerb() ?: label(chat).ifBlank { "Voice chat" },
             // A live call's tokens are the vendor's to count, and it doesn't report them as they're spent.
             detail = if (chat.live) null else voiceCallDetail(turn, tokensPerSecond(turn?.output ?: 0, seconds)),
             context = voiceCallContext(state.usage),

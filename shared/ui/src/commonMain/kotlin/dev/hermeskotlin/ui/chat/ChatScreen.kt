@@ -2708,7 +2708,8 @@ internal fun toolIcon(name: String): ImageVector = when {
 }
 
 /** The tool the running turn is in the middle of, if any. Its reply isn't always last: a queued prompt sits after it. */
-private fun ChatState.runningTool(): ToolActivity? =
+/** The tool at work in the streaming reply, if one is: the call's notification says so too. */
+internal fun ChatState.runningTool(): ToolActivity? =
     (messages.lastOrNull { it is ChatMessage.Assistant && it.streaming } as? ChatMessage.Assistant)?.tools?.lastOrNull { it.running }
 
 /** This turn's plan; one left over from an earlier turn isn't what's happening now. */
@@ -2786,7 +2787,7 @@ internal fun toolDone(tool: ToolActivity): LiveStep {
 /** The status of a turn started by a bot-to-bot delivery finishing (tools/bot_mode_dm.py's runner). */
 private val BOT_DELIVERY_STATUS = Regex("""Background Process Finished:.*(?:bot_mode_dm\.py|--run-delivery)""", RegexOption.IGNORE_CASE)
 
-private fun String.toolVerb(): String = toolInProgress(this)
+internal fun String.toolVerb(): String = toolInProgress(this)
 
 /** A passing message, like where a file was saved. */
 @Composable
