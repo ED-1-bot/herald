@@ -120,17 +120,22 @@ class StreamedSpeechTest {
     }
 
     /**
-     * Hears one request; then, over the reply, someone cuts in when the test says so ([cut]) and the recording
-     * goes to the gateway, having [goneOn] talking once the voice held, or not. Listens for good after that.
+     * Hears [requests] requests; then, over the reply, someone cuts in when the test says so ([cut]) and the recording
+     * goes to the gateway, having [goneOn] talking once the voice held, or not. [failFirst]: the microphone won't
+     * open over the first reply at all, as a transient failure in the call audio does. Listens for good after that.
      */
-    private class CutsIn(val goneOn: Boolean = true) : VoiceRecorder {
+    private class CutsIn(
+        val goneOn: Boolean = true,
+        val requests: Int = 1,
+        val failFirst: Boolean = false,
+    ) : VoiceRecorder {
         var recordings = 0
         val listening = MutableStateFlow(0)
         val cut = CompletableDeferred<Unit>()
         /** The cut was heard: by the listen it came in, or the next one when it came between two. */
         private var heardCut = false
         override suspend fun record(activity: VoiceActivity, onLevel: (Float) -> Unit, onSpeech: () -> Unit): Recording {
-            if (recordings++ >= 1) awaitCancellation()
+            if (recordings++ >= requests) awaitCancellation()
             onSpeech()
             return Recording(byteArrayOf(1, 2, 3), "audio/wav", heardSpeech = true)
         }
@@ -145,6 +150,7 @@ class StreamedSpeechTest {
             onListening: () -> Unit,
         ): Recording? {
             listening.update { it + 1 }
+            if (failFirst && listening.value == 1) return null
             onListening()
             if (heardCut) awaitCancellation()
             cut.await()
@@ -318,6 +324,56 @@ class StreamedSpeechTest {
         assertTrue(setup.spoken.isEmpty())
         // And the microphone listens over the next reply too.
         recorder.listening.first { it >= 2 }
+        setup.voice.stopChat()
+    }
+
+    /**
+     * The microphone wouldn't open over one reply — the call audio losing it for a moment. That reply is heard
+     * without barge-in, and the next is listened over again: one failure doesn't cost the chat the rest of its
+     * barge-in.
+     */
+    @Test
+    fun aMicrophoneThatFailedOnceListensAgainOnTheNextTurn() = runTest {
+        val recorder = CutsIn(requests = 2, failFirst = true)
+        val first = Stream()
+        val second = Stream()
+        var opened = 0
+        val setup = chat(
+            recorder = recorder,
+            transcripts = listOf("How was your day?", "It was long.", "Wait, what about tomorrow?"),
+            streams = { if (opened++ == 0) first else second },
+        )
+
+        setup.socket.event("message.start")
+        setup.socket.event("message.delta", """{"text":"It was a long day. "}""")
+        first.appended.first { it.isNotEmpty() }
+        first.gateway.send(SpeechStreamEvent.Start(sampleRate = 24_000))
+        first.gateway.send(SpeechStreamEvent.Audio(byteArrayOf(1, 0, 2, 0)))
+        setup.voice.chat.first { it.phase == VoicePhase.Speaking }
+        // Asked for, and it wouldn't open: the reply is heard without barge-in, and none is offered.
+        recorder.listening.first { it == 1 }
+        assertFalse(setup.voice.chat.value.bargeIn)
+        first.gateway.send(SpeechStreamEvent.End)
+        setup.socket.event("message.complete", """{"text":"It was a long day. ","status":"complete"}""")
+
+        // The next turn asks it again, and this time it listens over the reply.
+        setup.socket.submits.first { it.size == 2 }
+        // Asked once in the turn it failed, not over and over: only the chat's next turn brings it back.
+        assertEquals(1, recorder.listening.value)
+        setup.socket.event("message.start")
+        setup.socket.event("message.delta", """{"text":"It was a long day, yes. "}""")
+        second.appended.first { it.isNotEmpty() }
+        second.gateway.send(SpeechStreamEvent.Start(sampleRate = 24_000))
+        second.gateway.send(SpeechStreamEvent.Audio(byteArrayOf(1, 0, 2, 0)))
+        setup.voice.chat.first { it.phase == VoicePhase.Speaking }
+        recorder.listening.first { it >= 2 }
+        setup.voice.chat.first { it.bargeIn }
+
+        // Someone talks over it, and what they said goes as the next prompt.
+        recorder.cut.complete(Unit)
+        setup.socket.calls.first { "session.interrupt" in it }
+        setup.socket.submits.first { it.size == 3 }
+        assertEquals("Wait, what about tomorrow?", setup.socket.submits.value[2]["params"]!!.jsonObject["text"]!!.jsonPrimitive.content)
         setup.voice.stopChat()
     }
 

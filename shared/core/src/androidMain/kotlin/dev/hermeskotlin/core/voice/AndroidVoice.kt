@@ -33,11 +33,24 @@ import kotlin.math.sqrt
 
 /**
  * Records 16 kHz mono PCM with [AudioRecord] and hands it over as WAV, which every speech-to-text
- * provider takes. The level is Desktop's: RMS of the waveform, scaled so 1.0 is loud speech.
+ * provider takes. The level is Desktop's: RMS of the waveform, scaled so 1.0 is loud speech — but scaled against
+ * what this phone's own microphone gives ([MicLevel]), since a fixed count of full scale only holds for a
+ * browser's.
  */
-class AndroidVoiceRecorder : VoiceRecorder {
+class AndroidVoiceRecorder(
+    /** The dev build (androidApp's `dev`, which installs beside Herald): where barge-in's diagnostics are logged. */
+    private val devBuild: Boolean = false,
+) : VoiceRecorder {
 
     @Volatile private var finishRequested = false
+
+    /** What the user's own voice sounds like on this phone, for the levels barge-in works in. */
+    private val levels = MicLevel()
+
+    /** TEMPORARY, for tuning barge-in on a phone; nothing at all outside the dev build. */
+    private val trace = BargeInTrace(devBuild)
+
+    override val speechLevel: Float get() = levels.speechLevel
 
     @SuppressLint("MissingPermission") // The UI asks for RECORD_AUDIO before starting.
     override suspend fun record(activity: VoiceActivity, onLevel: (Float) -> Unit, onSpeech: () -> Unit): Recording = withContext(Dispatchers.IO) {
@@ -79,11 +92,14 @@ class AndroidVoiceRecorder : VoiceRecorder {
                 pcm.write(bytes.array(), 0, read * 2)
                 elapsed += read * 1000L / SAMPLE_RATE
                 // Desktop measures 8-bit samples (±128) against 42; 16-bit samples are 256 times larger.
-                val level = min(1.0, sqrt(sum / read) / 256.0 / 42.0).toFloat()
+                val rms = sqrt(sum / read).toFloat()
+                val level = min(1.0, rms / 256.0 / 42.0).toFloat()
                 onLevel(level)
                 val heardBefore = endOfSpeech.heardSpeech
                 val done = endOfSpeech.onFrame(level, elapsed)
                 if (endOfSpeech.heardSpeech && !heardBefore) onSpeech()
+                // What the user's own voice sounds like here, where barge-in's levels are measured from.
+                if (endOfSpeech.speaking) levels.heard(rms)
                 if (done) break
             }
         } finally {
@@ -137,6 +153,8 @@ class AndroidVoiceRecorder : VoiceRecorder {
             val pcm = ByteArrayOutputStream()
             var elapsed = 0L
             var tripped = false
+            /** The loudest since the trip, as RMS: if they went on talking, it's what their voice sounds like. */
+            var peakRms = 0f
             try {
                 // Inside the try, so the recorder is let go whatever they do; one that won't switch on is done without.
                 if (AcousticEchoCanceler.isAvailable()) runCatching { AcousticEchoCanceler.create(record.audioSessionId) }.getOrNull()?.let(effects::add)
@@ -157,17 +175,24 @@ class AndroidVoiceRecorder : VoiceRecorder {
                         sum += frame[i].toDouble() * frame[i]
                     }
                     elapsed += read * 1000L / SAMPLE_RATE
-                    val level = min(1.0, sqrt(sum / read) / 256.0 / 42.0).toFloat()
+                    val playingNow = playing()
+                    val rms = sqrt(sum / read).toFloat()
+                    // Against what this microphone gives, not a fixed count of full scale: quiet speech from a phone
+                    // lying on a table reads under every bar there is on the old scale, and never cuts in.
+                    val level = levels.level(rms)
                     if (tripped) {
+                        if (rms > peakRms) peakRms = rms
                         pcm.write(bytes.array())
                         onLevel(level)
                     } else {
                         preRoll.addLast(bytes.array())
                         if (preRoll.size > preRollFrames) preRoll.removeFirst()
                     }
-                    when (bargeIn.onFrame(level, elapsed, playing())) {
+                    trace.frame(level, bargeIn, playingNow, elapsed)
+                    when (bargeIn.onFrame(level, elapsed, playingNow)) {
                         BargeIn.Step.Tripped -> {
                             tripped = true
+                            trace.trip(level, bargeIn, elapsed)
                             // Send now counts from here: one asked before anyone cut in isn't about what they say.
                             finishRequested = false
                             preRoll.forEach(pcm::write)
@@ -180,6 +205,9 @@ class AndroidVoiceRecorder : VoiceRecorder {
                     // Send now, once it has heard them.
                     if (tripped && finishRequested) break
                 }
+                // Someone who went on talking once the voice held was really there: on this microphone, that is what
+                // their voice sounds like, and the bar is measured against it from here on.
+                if (bargeIn.spoke) levels.heard(peakRms)
             } finally {
                 runCatching { record.stop() }
                 // One that throws mustn't keep the microphone from being let go.

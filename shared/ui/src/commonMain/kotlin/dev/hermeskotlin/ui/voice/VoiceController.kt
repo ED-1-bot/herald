@@ -176,8 +176,8 @@ class VoiceController(
     private var voiced = ""
     /** The chained chat's barge-in settings, read once per chat; null outside one. */
     private var bargeIn: Deferred<BargeInSettings>? = null
-    /** The microphone wouldn't listen over the voice in this chat; it isn't asked again. */
-    private var cantListenOver = false
+    /** This turn's listen over the voice wouldn't open the microphone; the next turn asks it again. */
+    private var micRefusedOver = false
 
     /**
      * [pauseMs] is how long a quiet spell after speech has to last before it's sent. [opener]: a call the agent placed,
@@ -236,7 +236,6 @@ class VoiceController(
         // Read while the first listen goes on; it's needed once the first reply is on its way.
         val settings = async { audio.bargeIn(gateway, profile) }
         bargeIn = settings
-        cantListenOver = false
         var failures = 0
         var cutIn: String? = null
         try {
@@ -353,6 +352,9 @@ class VoiceController(
         activity: VoiceActivity,
         cutIn: String?,
     ): Turn {
+        // The microphone that wouldn't open last turn is asked again: a single failure costs its own turn, never
+        // the rest of the chat.
+        micRefusedOver = false
         // Hermes already waits on an answer (the chat opened from a call for one): that comes first, then the rest of
         // its turn, whose reply follows the last prompt.
         if (cutIn == null && session.state.value.inputRequests.any(VoiceAnswers::canAsk)) {
@@ -445,7 +447,7 @@ class VoiceController(
                     false
                 }
                 tripped.onAwait { true }
-                // A microphone that couldn't listen over the voice won't on the next try either.
+                // The microphone wouldn't open over the voice: this turn is heard without barge-in.
                 over.onAwait { heard -> heard != null }
             }
             // Null when it was its own voice, or a knock: the voice went on where it held; listen again.
@@ -460,8 +462,9 @@ class VoiceController(
      */
     private suspend fun listenOver(activity: VoiceActivity, tripped: CompletableDeferred<Unit>): Recording? {
         val settings = bargeIn?.await() ?: return null
-        if (!settings.enabled || cantListenOver) return null
-        val detector = BargeIn(settings, activity.silenceMs, roomFloor)
+        if (!settings.enabled || micRefusedOver) return null
+        // What the user's own speech sounds like on this phone, so the bar stops where they can still clear it.
+        val detector = BargeIn(settings, activity.silenceMs, roomFloor, recorder.speechLevel)
         val heard = try {
             recorder.listenOver(
                 detector,
@@ -480,9 +483,9 @@ class VoiceController(
             // Not offered once the microphone is closed again, as while a question is asked aloud.
             _chat.update { it.copy(bargeIn = false) }
         }
-        // The microphone wouldn't listen over the voice: the reply goes on as without barge-in, and doesn't offer it,
-        // this turn or the next.
-        if (heard == null) cantListenOver = true
+        // The microphone wouldn't listen over the voice: this reply goes on as without barge-in, and doesn't offer
+        // it. Only until the next turn, which asks again.
+        if (heard == null) micRefusedOver = true
         return heard
     }
 

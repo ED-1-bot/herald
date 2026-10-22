@@ -30,8 +30,11 @@ data class BargeInSettings(
  *   turned up. Over that echo, speech has to hold longer ([SUSTAINED_OVER_ECHO_MS]): the voice's own syllables
  *   rise and fall, someone talking over it doesn't. Someone already talking as the voice starts isn't learnt as
  *   its echo, since echo can't come before the voice; nor is someone talking a little under the bar, which would
- *   raise it out of their reach the longer they tried. However loud the echo, the bar stays where speech can reach
- *   it ([ECHO_BAR_CEILING_LEVEL]): an echo that trips it only holds the voice for a moment.
+ *   raise it out of their reach the longer they tried.
+ * - However loud the echo, the bar stops under the user's own speech ([speechLevel]), with the room it needs to
+ *   be heard over below it: an echo louder than that trips it, and the voice only holds for a moment
+ *   ([NOBODY_AFTER_MS]) before going on. A bar above speech would mean nobody could ever cut in, which is worse
+ *   than a hold.
  * - The voice's first moment after a real gap can't trip it ([BargeInSettings.graceMs]).
  * - Speech has to hold: most of the last [SUSTAINED_MS] above the bar, so dips inside a word don't start it over.
  *   Over a loud echo, most of the last [SUSTAINED_OVER_ECHO_MS].
@@ -40,20 +43,32 @@ data class BargeInSettings(
  * anyone went on talking once it held ([spoke]) tells someone cutting in from the phone hearing its own voice,
  * whose echo stops with it; when nobody did, it's over after [NOBODY_AFTER_MS] rather than a whole pause.
  *
- * The levels are the recorder's (RMS scaled so 1.0 is loud speech). They sit below Desktop's: the phone's
- * call microphone is quieter than a browser's, and its echo cancelling takes most of the voice out already.
+ * The levels are the recorder's (RMS against the loudest the user's own speech gets on this phone, so 1.0 is loud
+ * speech; [MicLevel] measures it). They sit below Desktop's: the phone's call microphone is quieter than a browser's,
+ * and its echo cancelling takes most of the voice out already.
  */
 class BargeIn(
     private val settings: BargeInSettings = BargeInSettings(),
     private val silenceMs: Long = 1_250,
     /** The room's quiet floor as an earlier listen in the same chat left it ([roomFloor]); 0 when none has. */
     roomFloor: Float = 0f,
+    /**
+     * The user's own speech as their microphone has measured it ([MicLevel.speechLevel]); 0 until it has. The bar
+     * stops under it, so however loud the voice's echo comes back, speech can still reach the bar.
+     */
+    speechLevel: Float = 0f,
 ) {
     private val scale = settings.multiplier?.takeIf { it.isFinite() && it > 0 }?.let { it / DEFAULT_MULTIPLIER } ?: 1.0
     private val floorMultiplier = (FLOOR_MULTIPLIER * scale).toFloat()
     private val playbackMin = (PLAYBACK_MIN_LEVEL * scale).toFloat()
     // A lower sensitivity setting still keeps the bar over the voice's own echo.
     private val bleedMultiplier = max(BLEED_MULTIPLIER * scale, MIN_BLEED_MARGIN).toFloat()
+    // Where the bar stops, however loud the echo: under what this user's speech reaches, which is measured and not
+    // set by the sensitivity, since a bar speech can't clear would cost barge-in entirely.
+    private val reachableBar = max(
+        MIN_TRIGGER_LEVEL,
+        (speechLevel.takeIf { it > 0f } ?: DEFAULT_SPEECH_LEVEL) * REACHABLE_SHARE,
+    )
 
     var tripped = false
         private set
@@ -68,6 +83,10 @@ class BargeIn(
 
     /** The room's quiet floor so far, for the next listen in the chat; 0 when it hasn't heard the room quiet. */
     val roomFloor: Float get() = floor
+
+    /** How loud the voice's own echo has come back, for the dev build's diagnostics; 0 until any has been learnt. */
+    val echo: Float get() = bleed
+
     private val bleedSamples = Levels(FLOOR_SAMPLES)
     private var bleed = 0f
     private var calibratedSince = -1L
@@ -122,8 +141,9 @@ class BargeIn(
         val above = floorLocked && level >= trigger && !inGrace
         recent.addLast(nowMs to above)
         while (recent.isNotEmpty() && nowMs - recent.first().first > SUSTAINED_OVER_ECHO_MS) recent.removeFirst()
-        // Over a loud echo its syllables can poke above the bar; someone talking stays there.
-        val hold = if (playing && trigger > playingBar()) SUSTAINED_OVER_ECHO_MS else SUSTAINED_MS
+        // Over a loud echo its syllables can poke above the bar; someone talking stays there. Whether the echo is
+        // what raised the bar is the echo itself, not where the speech-reachable cap then stopped it.
+        val hold = if (playing && bleed * bleedMultiplier > playingBar()) SUSTAINED_OVER_ECHO_MS else SUSTAINED_MS
         // Counted in place, every frame: the frames within the hold, when the first of them came, and those above the bar.
         var since = nowMs
         var frames = 0
@@ -145,14 +165,15 @@ class BargeIn(
     /** The bar speech has to clear now. */
     internal fun trigger(playing: Boolean): Float {
         if (!playing) return quietBar()
-        // Over the voice: above its own echo, so speech has to stand clearly over it; but never out of speech's reach.
-        return max(playingBar(), min(bleed * bleedMultiplier, ECHO_BAR_CEILING_LEVEL))
+        // Over the voice: above its own echo, so speech has to stand clearly over it; but never above what the
+        // user's own speech reaches, where nobody could cut in at all.
+        return min(max(playingBar(), bleed * bleedMultiplier), reachableBar)
     }
 
     private fun quietBar() = max(MIN_TRIGGER_LEVEL, floor * floorMultiplier)
 
     /** The bar over the voice before its echo is counted: raised for its bleed, capped so speech still clears it. */
-    private fun playingBar() = min(max(quietBar(), playbackMin), TRIGGER_CEILING_LEVEL)
+    private fun playingBar() = min(max(quietBar(), playbackMin), reachableBar)
 
     /** Someone was talking just before [nowMs]: most of the last [TALKING_MS] stood over the bar. */
     private fun talkingAt(nowMs: Long): Boolean {
@@ -235,9 +256,15 @@ class BargeIn(
         /** However sensitive it's set, the bar stays this far over the voice's echo. */
         const val MIN_BLEED_MARGIN = 1.2
         const val BLEED_PERCENTILE = 0.8f
-        const val TRIGGER_CEILING_LEVEL = 0.25f
-        /** The highest the bar goes over a loud echo; past it the echo trips it, and the voice only holds a moment. */
-        const val ECHO_BAR_CEILING_LEVEL = 0.4f
+        /** Ordinary speech, as a share of the loudest speech, until a chat has measured the user's own. */
+        const val DEFAULT_SPEECH_LEVEL = 0.5f
+        /** The share of their own speech the bar stops at, so what they say still clears it however loud the echo. */
+        const val REACHABLE_SHARE = 0.5f
+        /**
+         * Where the bar stops while the voice plays, over its echo as over the room: half of ordinary speech, and
+         * half of whatever the user's own speech is measured at once the chat has heard them.
+         */
+        const val TRIGGER_CEILING_LEVEL = DEFAULT_SPEECH_LEVEL * REACHABLE_SHARE
         /** After the voice's first moment, its echo is learnt only from frames this close to what's learnt already. */
         const val BLEED_LEARN_HEADROOM = 1.25f
         const val PLAYBACK_GAP_FOR_GRACE_MS = 1_000L

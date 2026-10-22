@@ -83,7 +83,7 @@ class BargeInTest {
         assertNotNull(mic.feed(0.3f, 1_000, playing = true))
     }
 
-    /** A loudspeaker with no echo cancelling: its own voice comes back loud, and mustn't pass for someone talking. */
+    /** A loudspeaker with no echo cancelling: its own voice comes back, and mustn't pass for someone talking. */
     @Test
     fun aLoudEchoRaisesTheBarAboveItself() {
         val bargeIn = BargeIn()
@@ -91,22 +91,62 @@ class BargeInTest {
         assertNull(mic.feed(0.01f, 1_000))
         // Syllables well over the stock bar, the whole reply long.
         repeat(20) {
-            assertNull(mic.feed(0.35f, 200, playing = true))
-            assertNull(mic.feed(0.15f, 200, playing = true))
+            assertNull(mic.feed(0.2f, 200, playing = true))
+            assertNull(mic.feed(0.08f, 200, playing = true))
         }
-        assertTrue(bargeIn.trigger(playing = true) > 0.35f)
+        assertTrue(bargeIn.trigger(playing = true) > 0.2f)
         // Someone talking clearly over it still cuts in.
         assertNotNull(mic.feed(0.9f, 1_000, playing = true))
     }
 
-    /** Turned right up with no echo cancelling to speak of: syllables louder than speech, the whole reply long. */
+    /**
+     * The echo comes back louder than the bar may go over it: the bar stops under the user's own speech anyway, so
+     * their voice still cuts in, and the echo only holds the voice for a moment where it trips it.
+     */
     @Test
-    fun aLoudSpeakerDoesNotCutInOnItself() {
+    fun anEchoLouderThanTheBarMayGoLeavesSpeechInReach() {
+        // Half of what this phone hears the user say, at their loudest.
+        val bargeIn = BargeIn(speechLevel = 0.4f)
+        val mic = Mic(bargeIn)
+        assertNull(mic.feed(0.01f, 1_000))
+        // Syllables over the bar, the whole reply long: they may not lift it above half their ordinary speech.
+        repeat(10) {
+            assertNull(mic.feed(0.35f, 120, playing = true), "cut in on its echo")
+            assertNull(mic.feed(0.1f, 280, playing = true))
+        }
+        assertEquals(0.4f * BargeIn.REACHABLE_SHARE, bargeIn.trigger(playing = true), 0.0001f)
+        // Their ordinary speech, quieter than the echo, still reaches the bar.
+        assertNotNull(mic.feed(0.25f, 1_000, playing = true))
+    }
+
+    /**
+     * Turned right up with no echo cancelling to speak of: syllables louder than the bar may go over them. The bar
+     * can't climb above speech's own reach to cover them, so it trips — but its echo stops with the voice, nobody
+     * went on talking, and the voice is only held a moment before going on ([NOBODY_AFTER_MS]).
+     */
+    @Test
+    fun anEchoTheBarCantCoverHoldsTheVoiceForAMoment() {
+        val bargeIn = BargeIn()
+        val mic = Mic(bargeIn)
+        assertNull(mic.feed(0.01f, 1_000))
+        val (_, step) = assertNotNull(mic.feed(0.6f, 2_000, playing = true))
+        assertEquals(BargeIn.Step.Tripped, step)
+        // The voice held, and its echo with it: nobody is there.
+        assertEquals(BargeIn.Step.Done, assertNotNull(mic.feed(0.02f, 3_000)).second)
+        assertFalse(bargeIn.spoke)
+    }
+
+    /**
+     * Its loud syllables stand over the bar the voice's softer echo leaves: the bar may not climb past where
+     * someone talking can reach it, so those syllables are held to a moment's trip like any loud echo.
+     */
+    @Test
+    fun anEchoWhoseLoudSyllablesStandOverTheBarDoesNotCutIn() {
         val mic = Mic()
         assertNull(mic.feed(0.01f, 1_000))
         repeat(20) {
-            assertNull(mic.feed(0.6f, 200, playing = true))
-            assertNull(mic.feed(0.3f, 200, playing = true))
+            assertNull(mic.feed(0.28f, 120, playing = true))
+            assertNull(mic.feed(0.12f, 280, playing = true))
         }
     }
 
@@ -117,8 +157,8 @@ class BargeInTest {
         assertNull(mic.feed(0.01f, 1_000))
         assertNull(mic.feed(0.15f, 600, playing = true))
         repeat(15) {
-            assertNull(mic.feed(0.5f, 200, playing = true))
-            assertNull(mic.feed(0.25f, 200, playing = true))
+            assertNull(mic.feed(0.28f, 120, playing = true))
+            assertNull(mic.feed(0.12f, 280, playing = true))
         }
         // Someone talking over it, and staying there, still cuts in.
         assertNotNull(mic.feed(0.9f, 1_000, playing = true))
@@ -130,11 +170,12 @@ class BargeInTest {
         val bargeIn = BargeIn()
         val mic = Mic(bargeIn)
         assertNull(mic.feed(0.01f, 1_000))
+        // A loudspeaker's syllables, each louder than the bar may go, with quieter ones between them.
         repeat(20) {
-            assertNull(mic.feed(0.8f, 200, playing = true))
-            assertNull(mic.feed(0.3f, 200, playing = true))
+            assertNull(mic.feed(0.8f, 120, playing = true))
+            assertNull(mic.feed(0.15f, 280, playing = true))
         }
-        assertEquals(BargeIn.ECHO_BAR_CEILING_LEVEL, bargeIn.trigger(playing = true))
+        assertEquals(BargeIn.TRIGGER_CEILING_LEVEL, bargeIn.trigger(playing = true))
         assertNotNull(mic.feed(0.5f, 1_000, playing = true))
     }
 
@@ -294,6 +335,66 @@ class BargeInTest {
         assertFalse(isTtsEcho("yes", reply))
         assertFalse(isTtsEcho("no", reply))
         assertFalse(isTtsEcho("anything", ""))
+    }
+
+    /**
+     * A phone lying on a table: its call microphone gives quiet speech a small fraction of what a browser's gives, and
+     * on the levels Desktop's fixed divisor made it read under every bar there is. Measured against the voice the
+     * phone has actually heard, the same speech stands clear of them.
+     */
+    @Test
+    fun quietSpeechOnAPhoneIsMeasuredAgainstTheVoiceItHeard() {
+        val levels = MicLevel()
+        // A turn of the user talking: their ordinary speech near RMS 2 400 of 32 767, asides near 1 200.
+        repeat(50) { levels.heard(2_400f) }
+        repeat(50) { levels.heard(1_200f) }
+        // Their loudest is what 1.0 means, whatever the microphone gives.
+        assertEquals(1f, levels.level(2_400f), 0.001f)
+        // Quiet speech, the phone on the table: 0.046 on the old scale, at the bar rather than over it.
+        val quiet = levels.level(500f)
+        assertTrue(quiet > BargeIn.PLAYBACK_MIN_LEVEL * 3, "quiet speech read $quiet")
+        // And the middle of what they say is where the bar stops, under the loudest of it.
+        assertEquals(0.5f, levels.speechLevel, 0.01f)
+    }
+
+    /** Before this phone has heard the user, the loud speech a browser's microphone gives stands in: as tuned. */
+    @Test
+    fun untilThePhoneHasHeardTheUserTheLevelsStayAsTuned() {
+        val levels = MicLevel()
+        val browserLoud = 42f * 256f
+        assertEquals(0.5f, levels.level(browserLoud / 2f), 0.001f)
+        assertEquals(1f, levels.level(browserLoud), 0.001f)
+        assertEquals(BargeIn.DEFAULT_SPEECH_LEVEL, levels.speechLevel, 0.001f)
+    }
+
+    @Test
+    fun aLevelRunsFromSilenceToLoudSpeech() {
+        val levels = MicLevel()
+        assertEquals(0f, levels.level(0f))
+        assertEquals(0f, levels.level(-3f))
+        assertEquals(1f, levels.level(40_000f))
+        // Nothing that arrives can make the reference nonsense: a jolt of nothing, or a sample that isn't one.
+        levels.heard(0f)
+        levels.heard(Float.NaN)
+        assertEquals(1f, levels.level(42f * 256f), 0.001f)
+    }
+
+    /** The whole of it: quiet speech, from a phone that has heard the user, cuts in over the voice's own echo. */
+    @Test
+    fun quietSpeechCutsInOverTheVoiceOnAPhoneLyingOnATable() {
+        val levels = MicLevel()
+        repeat(50) { levels.heard(2_400f) }
+        repeat(50) { levels.heard(1_200f) }
+        val bargeIn = BargeIn(speechLevel = levels.speechLevel)
+        val mic = Mic(bargeIn)
+        // A quiet room, then the voice through the speaker with most of it taken out by the echo cancelling.
+        assertNull(mic.feed(levels.level(60f), 1_000))
+        repeat(5) {
+            assertNull(mic.feed(levels.level(200f), 200, playing = true))
+            assertNull(mic.feed(levels.level(80f), 200, playing = true))
+        }
+        // Speaking quietly over it, and it cuts in.
+        assertNotNull(mic.feed(levels.level(500f), 1_000, playing = true))
     }
 
     private fun assertClose(expected: Double, actual: Double) = assertTrue(abs(expected - actual) < 1e-12, "expected $expected, was $actual")

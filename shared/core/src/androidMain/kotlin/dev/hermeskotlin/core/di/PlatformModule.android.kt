@@ -31,7 +31,8 @@ actual val platformModule: Module = module {
     // The browser sign-in comes back through this link; the app's manifest gives it to HeraldActivity.
     single<LoopbackReceiver> { AndroidLoopbackReceiver("${androidContext().packageName}:/signed-in") }
     single { WallpaperStore(AndroidBlobFile(File(androidContext().filesDir, "wallpaper.jpg")), get()) }
-    factory<VoiceRecorder> { AndroidVoiceRecorder() }
+    // The dev build installs beside Herald as "….dev": the only one that logs barge-in's levels for tuning.
+    factory<VoiceRecorder> { AndroidVoiceRecorder(devBuild = androidContext().packageName.endsWith(".dev")) }
     single<SpeechPlayer> { AndroidSpeechPlayer(androidContext()) }
     single<ReadAloudVoices> { FileReadAloudVoices(File(androidContext().cacheDir, "read-aloud")) }
     // One per screen, like the recorder: the chat and the assistant panel each stop only their own.

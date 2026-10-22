@@ -32,6 +32,10 @@ class EndOfSpeech(private val activity: VoiceActivity) {
     var heardSpeech = false
         private set
 
+    /** Whether the last frame stood at speech rather than near the room: what a recorder learns the voice from. */
+    var speaking = false
+        private set
+
     /** The measured background level, for diagnostics; negative until the first frame. */
     var noise = -1f
         private set
@@ -53,6 +57,7 @@ class EndOfSpeech(private val activity: VoiceActivity) {
         val speechBar = maxOf(activity.speechLevel, noise * SPEECH_OVER_NOISE)
         val quietBar = maxOf(activity.speechLevel * QUIET_FRACTION, noise * QUIET_OVER_NOISE)
         val speech = level >= speechBar
+        speaking = speech
         if (speech) {
             heardSpeech = true
             // A steady loud room lifts the bar too, slowly enough that a long sentence doesn't.
@@ -104,6 +109,13 @@ interface VoiceRecorder {
      * once, when speech is first heard.
      */
     suspend fun record(activity: VoiceActivity, onLevel: (Float) -> Unit = {}, onSpeech: () -> Unit = {}): Recording
+
+    /**
+     * The user's own speech in the levels [listenOver] works in, 1.0 being the loudest this microphone has heard
+     * them, as the last [record] measured it; 0 until one has. Barge-in's bar stops under it, so however loud the
+     * voice's echo comes back, speech can still clear the bar.
+     */
+    val speechLevel: Float get() = 0f
 
     /** Ends the recording in progress now and keeps what was said. */
     fun finish()
