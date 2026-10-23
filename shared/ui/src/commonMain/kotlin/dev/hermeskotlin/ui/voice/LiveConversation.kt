@@ -12,7 +12,10 @@ import dev.hermeskotlin.core.voice.LiveCommands
 import dev.hermeskotlin.core.voice.LiveEvent
 import dev.hermeskotlin.core.voice.LiveFragment
 import dev.hermeskotlin.core.voice.LiveHistoryMessage
+import dev.hermeskotlin.core.voice.Narration
 import dev.hermeskotlin.core.voice.VoiceAnswers
+import dev.hermeskotlin.core.voice.monotonicMs
+import dev.hermeskotlin.core.voice.narrationActivity
 import dev.hermeskotlin.core.voice.DeviceLock
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.job
@@ -52,6 +55,8 @@ internal class LiveConversation(
     private val lock: DeviceLock = DeviceLock.None,
     /** A call the agent placed: what the voice is told to say first, why it called. */
     private val opener: String? = null,
+    /** The clock the narrator reads, so a test drives its cadence on its own scheduler. */
+    private val clock: () -> Long = { monotonicMs() },
 ) {
     private val transcript = ArrayList<LiveFragment>()
     private var eventSeq = 0
@@ -309,8 +314,12 @@ internal class LiveConversation(
     /**
      * Feeds the voice the replies to the prompt [askedKey] as they stream, until its turn ends. [alreadySaid] is
      * what of each reply was there before, not to be said again.
+     *
+     * While it runs, the voice is told what Hermes is at on the narrator's cadence, not only when a tool starts:
+     * a job of half a minute gives it one line to open with, and a dozen after, so it can say something fresh if
+     * it talks during the wait instead of leaving it as the one it was handed at the start.
      */
-    private suspend fun relayTurn(id: String?, askedKey: String?, alreadySaid: List<String> = emptyList()) {
+    private suspend fun relayTurn(id: String?, askedKey: String?, alreadySaid: List<String> = emptyList()) = coroutineScope {
         fun asked(chat: ChatState) = chat.messages.indexOfFirst { it.key == askedKey }.takeIf { it >= 0 }
             ?: chat.messages.indexOfLast { it is ChatMessage.User }
         // The markdown spoken so far of each reply of the turn, in order. A reply reloaded from history that
@@ -318,26 +327,51 @@ internal class LiveConversation(
         val spoken = alreadySaid.toMutableList()
         var spokeAny = false
         var tool: String? = null
-        session.state.first { chat ->
-            val asked = asked(chat)
-            val replies = if (asked < 0) emptyList() else chat.messages.drop(asked + 1).filterIsInstance<ChatMessage.Assistant>()
-            val running = replies.lastOrNull()?.tools?.lastOrNull { it.running }?.let { it.detail ?: it.name }
-            // The chip follows the tool running now, and goes once it's done.
-            if (running != tool) {
-                tool = running
-                state.update { it.copy(working = running) }
-                if (running != null) send(LiveCommands.thinking(nextId("think"), id, "Hermes is working: $running. Not done yet."))
+        val narrating = launch { narrate(id, askedKey) }
+        try {
+            session.state.first { chat ->
+                val asked = asked(chat)
+                val replies = if (asked < 0) emptyList() else chat.messages.drop(asked + 1).filterIsInstance<ChatMessage.Assistant>()
+                val running = replies.lastOrNull()?.tools?.lastOrNull { it.running }?.let { it.detail ?: it.name }
+                // The chip follows the tool running now, and goes once it's done.
+                if (running != tool) {
+                    tool = running
+                    state.update { it.copy(working = running) }
+                    if (running != null) send(LiveCommands.thinking(nextId("think"), id, "Hermes is working: $running. Not done yet."))
+                }
+                replies.forEachIndexed { i, reply ->
+                    val before = spoken.getOrNull(i).orEmpty()
+                    val from = if (reply.text.startsWith(before)) before.length else reply.text.length
+                    // A reply still streaming goes a whole sentence at a time; a finished one goes to its end.
+                    val end = maxOf(from, if (reply.streaming && chat.running) speakableCut(reply.text) else reply.text.length)
+                    if (end > from) spokeAny = speak(id, reply.text.substring(from, end)) || spokeAny
+                    if (i < spoken.size) spoken[i] = reply.text.substring(0, end) else spoken += reply.text.substring(0, end)
+                }
+                if (!chat.running && !spokeAny) send(LiveCommands.thinking(nextId("think"), id, "Hermes finished that request without a spoken result."))
+                !chat.running
             }
-            replies.forEachIndexed { i, reply ->
-                val before = spoken.getOrNull(i).orEmpty()
-                val from = if (reply.text.startsWith(before)) before.length else reply.text.length
-                // A reply still streaming goes a whole sentence at a time; a finished one goes to its end.
-                val end = maxOf(from, if (reply.streaming && chat.running) speakableCut(reply.text) else reply.text.length)
-                if (end > from) spokeAny = speak(id, reply.text.substring(from, end)) || spokeAny
-                if (i < spoken.size) spoken[i] = reply.text.substring(0, end) else spoken += reply.text.substring(0, end)
-            }
-            if (!chat.running && !spokeAny) send(LiveCommands.thinking(nextId("think"), id, "Hermes finished that request without a spoken result."))
-            !chat.running
+        } finally {
+            narrating.cancel()
+        }
+    }
+
+    /**
+     * Tells the voice what Hermes is at every few seconds while the turn [askedKey] runs, on the same cadence the
+     * chained chat speaks on: the tool line it was handed when the tool started is all it has otherwise, and a
+     * voice waiting out a long job says it once and then has nothing.
+     */
+    private suspend fun narrate(id: String?, askedKey: String?) {
+        val narration = Narration(clock)
+        while (currentCoroutineContext().isActive) {
+            delay(narration.waitMs())
+            val chat = session.state.value
+            if (!chat.running) return
+            val from = chat.messages.indexOfFirst { it.key == askedKey }.takeIf { it >= 0 }
+                ?: chat.messages.indexOfLast { it is ChatMessage.User }
+            val line = narration.line(narrationActivity(chat, from)) ?: continue
+            // What the chip shows is what the voice was just told.
+            state.update { it.copy(working = line) }
+            send(LiveCommands.thinking(nextId("think"), id, line))
         }
     }
 

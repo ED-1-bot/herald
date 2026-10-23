@@ -891,4 +891,48 @@ class LiveConversationTest {
         voice.chat.first { it.phase == VoicePhase.Off }
         assertTrue(call.closed)
     }
+
+    /**
+     * The voice gets a fresh line about every five seconds while the turn runs, not only the one it's handed when
+     * the tool starts: a voice waiting out a long job otherwise says that once and has nothing after it.
+     */
+    @Test
+    fun theVoiceIsToldWhatHermesIsAtWhileTheTurnRuns() = runTest {
+        val client = http("gpt-live", mutableListOf())
+        val socket = Socket()
+        val connection = GatewayConnection(AuthApi(client, PersistentCookiesStorage(InMemoryKeyValueStore())), { _, _ -> socket }, backgroundScope)
+        connection.start(gateway)
+        connection.state.first { it is ConnectionState.Connected }
+        val session = ChatSession(gateway, null, null, connection, SessionsApi(client), backgroundScope)
+        session.start()
+        val call = FakeCall()
+        val voice = VoiceController(
+            AudioApi(client),
+            NoRecorder,
+            Silent,
+            backgroundScope,
+            backgroundScope,
+            // The narrator's clock is the test's, so the cadence is the test scheduler's.
+            clock = { testScheduler.currentTime },
+        ) { call }
+        voice.startChat(session, gateway, null)
+        voice.chat.first { it.live && it.phase == VoicePhase.Listening }
+        call.receive("""{"type":"session.started","session":{"id":"live-1"}}""")
+        call.receive("""{"type":"session.input_transcript.delta","delta":"Clean the build","start_ms":0,"end_ms":900}""")
+        call.receive("""{"type":"session.delegation.created","delegation":{"id":"d1"}}""")
+        socket.submits.first { it.size == 1 }
+        socket.event("message.start")
+        socket.event("tool.start", """{"tool_id":"t1","name":"web_search","context":"weather Chicago"}""")
+
+        // What the voice is handed at the tool's start, as before.
+        voice.chat.first { it.working == "weather Chicago" }
+        assertEquals(listOf("Hermes is working: weather Chicago. Not done yet."), call.said("session.thinking.append"))
+        // And then the narrator's own line, five seconds on, for it to say in its own words.
+        voice.chat.first { it.working == "Searching the web for weather Chicago." }
+        assertEquals(
+            listOf("Hermes is working: weather Chicago. Not done yet.", "Searching the web for weather Chicago."),
+            call.said("session.thinking.append"),
+        )
+        voice.stopChat()
+    }
 }

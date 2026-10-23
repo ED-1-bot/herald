@@ -19,9 +19,13 @@ import dev.hermeskotlin.core.voice.BargeInSettings
 import dev.hermeskotlin.core.voice.DeviceDictation
 import dev.hermeskotlin.core.voice.DeviceDictationUnavailable
 import dev.hermeskotlin.core.voice.LiveCalls
+import dev.hermeskotlin.core.voice.Narration
+import dev.hermeskotlin.core.voice.NarrationSpeaker
 import dev.hermeskotlin.core.voice.ReadAloudVoices
 import dev.hermeskotlin.core.voice.InMemoryReadAloudVoices
 import dev.hermeskotlin.core.voice.VoiceKeepAlive
+import dev.hermeskotlin.core.voice.monotonicMs
+import dev.hermeskotlin.core.voice.narrationActivity
 import dev.hermeskotlin.core.voice.Recording
 import dev.hermeskotlin.core.voice.SpeechPlayer
 import dev.hermeskotlin.core.voice.SpeechStream
@@ -138,6 +142,10 @@ class VoiceController(
     private val speechStreams: SpeechStreams? = null,
     /** An approval is only taken by voice while the phone is unlocked. */
     private val deviceLock: DeviceLock = DeviceLock.None,
+    /** The clock the narrator reads, so a test drives its cadence on its own scheduler. */
+    private val clock: () -> Long = { monotonicMs() },
+    /** What says the narrator's lines: the gateway's voice, the reply's own, unless a test has another. */
+    private val narrationSpeaker: NarrationSpeaker? = null,
     private val liveCalls: LiveCalls? = null,
 ) {
     private val _chat = MutableStateFlow(VoiceChatState())
@@ -178,6 +186,8 @@ class VoiceController(
     private var bargeIn: Deferred<BargeInSettings>? = null
     /** The microphone wouldn't listen over the voice in this chat; it isn't asked again. */
     private var cantListenOver = false
+    /** What is saying that Hermes is still at it, while the turn runs; null when nothing is. */
+    private var narrator: Job? = null
 
     /**
      * [pauseMs] is how long a quiet spell after speech has to last before it's sent. [opener]: a call the agent placed,
@@ -194,6 +204,7 @@ class VoiceController(
         cancelDictation()
         // The voice chat has the speaker now.
         stopReading()
+        stopNarrating()
         _chat.value = VoiceChatState(VoicePhase.Listening)
         stoppedByUser = false
         roomFloor = 0f
@@ -224,6 +235,7 @@ class VoiceController(
         job.invokeOnCompletion {
             // A newer chat may already hold it again.
             if (chatJob === job || chatJob == null) {
+                stopNarrating()
                 held = false
                 keepAlive?.release()
             }
@@ -292,7 +304,7 @@ class VoiceController(
         if (status !is ApiResult.Success || !status.value.live) return false
         val call = calls.create() ?: return false
         _chat.value = VoiceChatState(VoicePhase.Connecting, live = true)
-        val conversation = LiveConversation(call, session, _chat, deviceLock, opener?.liveOpener())
+        val conversation = LiveConversation(call, session, _chat, deviceLock, opener?.liveOpener(), clock)
         live = conversation
         var error: String? = null
         try {
@@ -321,6 +333,7 @@ class VoiceController(
 
     fun stopChat() {
         stoppedByUser = true
+        stopNarrating()
         chatJob?.cancel()
         chatJob = null
     }
@@ -353,50 +366,58 @@ class VoiceController(
         activity: VoiceActivity,
         cutIn: String?,
     ): Turn {
-        // Hermes already waits on an answer (the chat opened from a call for one): that comes first, then the rest of
-        // its turn, whose reply follows the last prompt.
-        if (cutIn == null && session.state.value.inputRequests.any(VoiceAnswers::canAsk)) {
-            val from = session.state.value.messages.indexOfLast { it is ChatMessage.User } + 1
-            return finishTurn(session, from, gateway, profile, activity, streamed = false)
-        }
-        // What was said over the last reply was heard and written down already.
-        val transcript = cutIn ?: when (val heard = hear(gateway, profile, activity)) {
-            Heard.Broken -> return Turn.End
-            Heard.Silence -> return Turn.Quiet
-            Heard.Unclear -> return Turn.Failed
-            is Heard.Words -> heard.text.also { if (isVoiceStopCommand(it)) return Turn.End }
-        }
+        try {
+            // Hermes already waits on an answer (the chat opened from a call for one): that comes first, then the rest of
+            // its turn, whose reply follows the last prompt.
+            if (cutIn == null && session.state.value.inputRequests.any(VoiceAnswers::canAsk)) {
+                val from = session.state.value.messages.indexOfLast { it is ChatMessage.User } + 1
+                narrate(session, gateway, profile, from)
+                return finishTurn(session, from, gateway, profile, activity, streamed = false)
+            }
+            // What was said over the last reply was heard and written down already.
+            val transcript = cutIn ?: when (val heard = hear(gateway, profile, activity)) {
+                Heard.Broken -> return Turn.End
+                Heard.Silence -> return Turn.Quiet
+                Heard.Unclear -> return Turn.Failed
+                is Heard.Words -> heard.text.also { if (isVoiceStopCommand(it)) return Turn.End }
+            }
 
-        _chat.update { it.copy(phase = VoicePhase.Thinking, caption = transcript.trim(), captionIsVoice = false) }
-        val sentAt = session.state.value.messages.size
-        voicedSoFar = ""
-        voicedUntilAsked = false
-        voiced = ""
-        val cut = coroutineScope {
-            // The speech socket opens while the prompt goes out, so the first words don't wait for it.
-            val opening = async { openSpeech(gateway, profile) }
-            val sent = try {
-                // What was said over a reply replaces it: a turn still running stops first.
-                if (cutIn != null) session.stopAndSubmit(transcript).outcome == SendOutcome.Sent else session.send(transcript)
-            } catch (e: Throwable) {
-                closeUnused(opening)
-                throw e
+            _chat.update { it.copy(phase = VoicePhase.Thinking, caption = transcript.trim(), captionIsVoice = false) }
+            val sentAt = session.state.value.messages.size
+            voicedSoFar = ""
+            voicedUntilAsked = false
+            voiced = ""
+            val cut = coroutineScope {
+                // The speech socket opens while the prompt goes out, so the first words don't wait for it.
+                val opening = async { openSpeech(gateway, profile) }
+                val sent = try {
+                    // What was said over a reply replaces it: a turn still running stops first.
+                    if (cutIn != null) session.stopAndSubmit(transcript).outcome == SendOutcome.Sent else session.send(transcript)
+                } catch (e: Throwable) {
+                    closeUnused(opening)
+                    throw e
+                }
+                if (!sent) {
+                    _chat.update { it.copy(error = session.state.value.error ?: "Couldn't send that.") }
+                    closeUnused(opening)
+                    return@coroutineScope null
+                }
+                // From here the agent is at work, and the wait for its reply is the long part of a turn.
+                narrate(session, gateway, profile, sentAt)
+                overVoice(session, gateway, profile, activity) { voiceAsWritten(session, sentAt, opening) }
+            } ?: return Turn.Failed
+            val voiced = when (cut) {
+                is Cut.Over -> return cut.turn
+                is Cut.Done -> cut.value
             }
-            if (!sent) {
-                _chat.update { it.copy(error = session.state.value.error ?: "Couldn't send that.") }
-                closeUnused(opening)
-                return@coroutineScope null
-            }
-            overVoice(session, gateway, profile, activity) { voiceAsWritten(session, sentAt, opening) }
-        } ?: return Turn.Failed
-        val voiced = when (cut) {
-            is Cut.Over -> return cut.turn
-            is Cut.Done -> cut.value
+            // Skipped while the agent is still at work: listen again now rather than once it's done. Anything it then
+            // waits on is asked at the start of the next turn.
+            if (voiced == Voiced.Skipped) return Turn.Done
+            return finishTurn(session, sentAt, gateway, profile, activity, streamed = voiced == Voiced.Yes)
+        } finally {
+            // The reply's voice, or the next listen, has the speaker: nothing of the narrator's follows it.
+            stopNarrating()
         }
-        // Skipped while the agent is still at work: listen again now rather than once it's done. Anything it then
-        // waits on is asked at the start of the next turn.
-        if (voiced == Voiced.Skipped) return Turn.Done
-        return finishTurn(session, sentAt, gateway, profile, activity, streamed = voiced == Voiced.Yes)
     }
 
     /** The reply once the prompt has gone, voiced as it's written where the gateway can. */
@@ -575,6 +596,8 @@ class VoiceController(
                 stopped = true
                 if (!askAloud(session, request, gateway, profile, activity)) return Turn.End
                 _chat.update { it.copy(phase = VoicePhase.Thinking) }
+                // The answer is in and the agent is back at work: the wait is announced again, from the start.
+                narrate(session, gateway, profile, from)
                 continue
             }
             // A password or a code is never said aloud, nor an approval taken from a locked phone: the turn waits,
@@ -591,6 +614,7 @@ class VoiceController(
                 _chat.update { it.copy(phase = VoicePhase.Speaking, caption = said, captionIsVoice = true) }
                 speak(said, gateway, profile)
                 _chat.update { it.copy(phase = VoicePhase.Thinking) }
+                narrate(session, gateway, profile, from)
                 continue
             }
             if (!chat.running && chat.inputRequests.none(VoiceAnswers::canAsk)) break
@@ -834,6 +858,8 @@ class VoiceController(
 
     /** Plays the voice as it streams in; false when the player failed. */
     private suspend fun playStreamed(format: SpeechStreamEvent.Start, audio: Channel<ByteArray>): Boolean = try {
+        // The reply is sounding: nothing of the narrator's goes on from here.
+        stopNarrating()
         player.playPcm(format.sampleRate, format.channels, audio, ::onSound)
         true
     } catch (e: CancellationException) {
@@ -879,8 +905,58 @@ class VoiceController(
         _chat.update { if (it.phase == VoicePhase.Speaking || it.phase == VoicePhase.Thinking) it.copy(phase = if (sound) VoicePhase.Speaking else VoicePhase.Thinking) else it }
     }
 
+    /**
+     * Says what Hermes is at, for as long as the turn runs, so a job that takes half a minute isn't half a minute
+     * of silence: a line every few seconds at first, then every fifteen or so as nothing new comes in, and every
+     * five again once a tool or a status does. [from] is where this turn's reply starts in the chat, which is
+     * where the tool running now is.
+     *
+     * It stops where it is ([stopNarrating]) the moment the reply's own voice starts, so a line never lands
+     * between two of the reply's sentences, and again when the turn ends.
+     */
+    private fun narrate(session: ChatSession, gateway: GatewayUrl, profile: String?, from: Int) {
+        stopNarrating()
+        val narration = Narration(clock)
+        narrator = scope.launch {
+            while (currentCoroutineContext().isActive) {
+                delay(narration.waitMs())
+                // The reply is sounding right now: this line would be over it.
+                if (playing.value) continue
+                val chat = session.state.value
+                if (!chat.running) break
+                val line = narration.line(narrationActivity(chat, from)) ?: continue
+                // The chip shows the words that were said, so the screen and the voice never disagree.
+                _chat.update { it.copy(working = line) }
+                val speaker = narrationSpeaker
+                if (speaker != null) speaker.say(line) else sayAsNarrator(line, gateway, profile)
+            }
+        }
+    }
+
+    /** Nothing more is said of the narrator's: the reply's voice, or the end of the turn, takes over. */
+    private fun stopNarrating() {
+        narrator?.cancel()
+        narrator = null
+        _chat.update { if (it.working != null) it.copy(working = null) else it }
+    }
+
+    /**
+     * Says one narrator's line. It isn't the reply, so it adds to what's known to be the phone's own voice rather
+     * than replacing it, since its echo over the microphone is its own voice too. A line the gateway can't voice
+     * is passed over in silence: a commentary on the wait is never worth an error over the turn.
+     */
+    private suspend fun sayAsNarrator(line: String, gateway: GatewayUrl, profile: String?) = coroutineScope {
+        voiced = listOf(voiced, line).filter { it.isNotEmpty() }.joinToString(" ")
+        val job = launch { voice(line, gateway, profile) { } }
+        speechJob = job
+        job.join()
+        speechJob = null
+    }
+
     /** Reads [text] aloud in the voice chat; Skip cuts it. */
     private suspend fun speak(text: String, gateway: GatewayUrl, profile: String?) = coroutineScope {
+        // The reply has the voice now, and nothing of the narrator's goes between its words.
+        stopNarrating()
         voiced = text
         // A child of the conversation, so ending the chat stops the voice; skipping cancels only this.
         val job = launch { voice(text, gateway, profile) { error -> _chat.update { it.copy(error = error) } } }
